@@ -135,6 +135,10 @@ impl DriverRegistry {
             .find(|d| d.component_type() == component_type)
             .cloned()
     }
+
+    pub async fn power_meters(&self) -> Vec<Arc<dyn PowerMeter>> {
+        self.power_meters.read().await.clone()
+    }
 }
 
 // Linux-specific Implementations
@@ -273,6 +277,7 @@ pub mod linux {
     #[async_trait]
     impl<F: Filesystem + 'static> PowerMeter for RaplPowerMeter<F> {
         async fn measurement_points(&self) -> Result<Vec<MeasurementPoint>> {
+            // Treat package-0 as a single point for now
             let pkg = self.base_path.join("intel-rapl:0");
             let name = self
                 .fs
@@ -280,35 +285,86 @@ pub mod linux {
                 .await
                 .unwrap_or_else(|_| "package-0".into());
             Ok(vec![MeasurementPoint {
-                id: ComponentId::new(),
+                id: ComponentId::new(), // not tied to a discovered component yet
                 name,
                 measurement_type: MeasurementType::Rapl,
             }])
         }
 
         async fn read_power(&self, _point: &MeasurementPoint) -> Result<PowerMeasurement> {
-            // Placeholder: read a limit and present as "power"
-            let p_uw = self
+            // One-shot read: sample energy_uj twice with a short delay
+            let energy_path = self.base_path.join("intel-rapl:0/energy_uj");
+            let t0 = chrono::Utc::now();
+            let e0 = self
                 .fs
-                .read_u64(
-                    &self
-                        .base_path
-                        .join("intel-rapl:0/constraint_0_power_limit_uw"),
-                )
-                .await
-                .unwrap_or(15_000_000);
+                .read_to_string(&energy_path)
+                .await?
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| Error::Parse(e.to_string()))?;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let t1 = chrono::Utc::now();
+            let e1 = self
+                .fs
+                .read_to_string(&energy_path)
+                .await?
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| Error::Parse(e.to_string()))?;
+
+            // handle wrap-around with u64 energy counter by saturating at 0 if misordered
+            let de_uj = e1.saturating_sub(e0) as f64;
+            let dt_s = (t1 - t0).num_microseconds().unwrap_or(50_000) as f64 / 1_000_000.0;
+            let watts = if dt_s > 0.0 {
+                (de_uj / 1_000_000.0) / dt_s
+            } else {
+                0.0
+            };
+
             Ok(PowerMeasurement {
-                watts: p_uw as f64 / 1_000_000.0,
+                watts,
                 uncertainty: 0.1,
-                timestamp: chrono::Utc::now(),
+                timestamp: t1,
             })
         }
 
         async fn start_monitoring(
             &self,
-            _interval: std::time::Duration,
+            interval: std::time::Duration,
         ) -> Result<MeasurementStream> {
-            Err(Error::Other(anyhow::anyhow!("monitoring not implemented")))
+            let energy_path = self.base_path.join("intel-rapl:0/energy_uj");
+            let fs = self.fs.clone();
+
+            let mut last_e = None::<u64>;
+            let mut last_t = None::<chrono::DateTime<chrono::Utc>>;
+
+            let s = async_stream::stream! {
+                loop {
+                    let now = chrono::Utc::now();
+                    let e = match fs.read_to_string(&energy_path).await {
+                        Ok(s) => match s.trim().parse::<u64>() {
+                            Ok(v) => v,
+                            Err(_) => { tokio::time::sleep(interval).await; continue; }
+                        },
+                        Err(_) => { tokio::time::sleep(interval).await; continue; }
+                    };
+
+                    if let (Some(e0), Some(t0)) = (last_e, last_t) {
+                        let de_uj = e.saturating_sub(e0) as f64;
+                        let dt_s = (now - t0).num_microseconds().unwrap_or(0) as f64 / 1_000_000.0;
+                        if dt_s > 0.0 {
+                            let watts = (de_uj / 1_000_000.0) / dt_s;
+                            yield PowerMeasurement { watts, uncertainty: 0.1, timestamp: now };
+                        }
+                    }
+
+                    last_e = Some(e);
+                    last_t = Some(now);
+                    tokio::time::sleep(interval).await;
+                }
+            };
+
+            Ok(Box::pin(s))
         }
     }
 }

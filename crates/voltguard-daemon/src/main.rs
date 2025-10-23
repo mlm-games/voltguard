@@ -1,7 +1,9 @@
 use std::os::fd::AsFd;
+use std::os::unix::fs::chown;
 use std::sync::Arc;
 use tokio::signal;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use voltguard_config as config;
 use voltguard_core::PowerManager;
 use voltguard_engine::{MonitoringEngine, OptimizationEngine};
 use voltguard_hal::DriverRegistry;
@@ -10,14 +12,22 @@ use voltguard_policy::PolicyEngine;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "info");
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     info!("Starting VoltGuard daemon");
 
+    let cfg = config::load().unwrap_or_else(|e| {
+        warn!("Failed to load config, using defaults: {}", e);
+        config::Config::default()
+    });
+
     // Build the daemon
-    let daemon = Daemon::new().await?;
+    let daemon = Daemon::new(cfg).await?;
 
     // Run the daemon
     daemon.run().await?;
@@ -30,14 +40,13 @@ struct Daemon {
     monitoring_engine: Arc<MonitoringEngine>,
     optimization_engine: Arc<OptimizationEngine>,
     policy_engine: Arc<PolicyEngine>,
+    socket_path: std::path::PathBuf,
 }
 
 impl Daemon {
-    async fn new() -> anyhow::Result<Self> {
-        // Create driver registry and register drivers
+    async fn new(cfg: config::Config) -> anyhow::Result<Self> {
         let registry = Arc::new(DriverRegistry::new());
 
-        // Register platform-specific drivers
         #[cfg(target_os = "linux")]
         {
             use std::sync::Arc as SyncArc;
@@ -48,17 +57,18 @@ impl Daemon {
             registry
                 .register_power_meter(SyncArc::new(RaplPowerMeter::default()))
                 .await;
-            // Register other drivers...
         }
 
-        // Create core power manager
-        let power_manager = Arc::new(PowerManager::new(registry));
+        let power_manager = Arc::new(PowerManager::new(registry.clone()));
         power_manager.initialize().await?;
 
-        // Create engines
-        let monitoring_engine = Arc::new(MonitoringEngine::new(power_manager.clone()));
+        let meters = registry.power_meters().await;
+        let monitoring_engine = Arc::new(MonitoringEngine::new(power_manager.clone(), meters));
         let metrics = monitoring_engine.metrics();
-        let optimization_engine = Arc::new(OptimizationEngine::new(power_manager.clone(), metrics));
+        let optimization_engine = Arc::new(OptimizationEngine::new(
+            power_manager.clone(),
+            metrics.clone(),
+        ));
         let policy_engine = Arc::new(PolicyEngine::new(power_manager.clone()));
 
         Ok(Self {
@@ -66,6 +76,7 @@ impl Daemon {
             monitoring_engine,
             optimization_engine,
             policy_engine,
+            socket_path: cfg.daemon.socket_path,
         })
     }
 
@@ -99,53 +110,78 @@ impl Daemon {
         });
 
         // Setup IPC server for CLI communication
-        let ipc_server = IpcServer::new(self.power_manager.clone());
+        let ipc_server = IpcServer::new(
+            self.power_manager.clone(),
+            self.monitoring_engine.metrics(),
+            self.socket_path.clone(),
+        );
         tokio::spawn(async move {
             if let Err(e) = ipc_server.run().await {
                 error!("IPC server error: {}", e);
             }
         });
 
-        // Wait for shutdown signal
+        // Wait for shutdown
         info!("VoltGuard daemon running");
         signal::ctrl_c().await?;
         info!("Shutting down VoltGuard daemon");
-
         Ok(())
     }
 }
 
 // IPC Server for CLI Communication
+
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use nix::unistd::Uid;
+use nix::unistd::{Gid, Uid};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use voltguard_api::{IpcRequest, IpcResponse, PowerProfile, ProtocolVersion, PROTOCOL};
+use voltguard_engine::MetricsCollector;
 
 struct IpcServer {
     power_manager: Arc<PowerManager>,
+    metrics: Arc<MetricsCollector>,
+    socket_path: std::path::PathBuf,
 }
 
 impl IpcServer {
-    fn new(power_manager: Arc<PowerManager>) -> Self {
-        Self { power_manager }
+    fn new(
+        power_manager: Arc<PowerManager>,
+        metrics: Arc<MetricsCollector>,
+        socket_path: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            power_manager,
+            metrics,
+            socket_path,
+        }
     }
 
     async fn run(&self) -> anyhow::Result<()> {
-        let socket_path = "/var/run/voltguard.sock";
+        let socket_path = &self.socket_path;
 
         // Remove old socket if exists
         let _ = std::fs::remove_file(socket_path);
 
         let listener = UnixListener::bind(socket_path)?;
-        info!("IPC server listening on {}", socket_path);
+        info!("IPC server listening on {}", socket_path.display());
+
+        // Tighten perms: 0660; optionally honor VOLTGUARD_GROUP for group ownership
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
+        if let Ok(group) = std::env::var("VOLTGUARD_GROUP") {
+            if let Ok(g) = group.parse::<u32>() {
+                let _ = chown(socket_path, None, Some(Gid::from_raw(g).into()));
+            }
+        }
 
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let power_manager = self.power_manager.clone();
+                    let metrics = self.metrics.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, power_manager).await {
+                        if let Err(e) = handle_client(stream, power_manager, metrics).await {
                             error!("Client handler error: {}", e);
                         }
                     });
@@ -158,7 +194,11 @@ impl IpcServer {
     }
 }
 
-async fn handle_client(stream: UnixStream, power_manager: Arc<PowerManager>) -> anyhow::Result<()> {
+async fn handle_client(
+    stream: UnixStream,
+    power_manager: Arc<PowerManager>,
+    metrics: Arc<MetricsCollector>,
+) -> anyhow::Result<()> {
     let fd = stream.as_fd();
     let creds = getsockopt(&fd, PeerCredentials)?;
     let uid = Uid::from_raw(creds.uid());
@@ -188,8 +228,19 @@ async fn handle_client(stream: UnixStream, power_manager: Arc<PowerManager>) -> 
 
     // Process requests
     while reader.read_line(&mut line).await? > 0 {
-        let request: IpcRequest = serde_json::from_str(&line)?;
-        let response = handle_request(request, uid, &power_manager).await;
+        let request: IpcRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                respond(
+                    &mut writer,
+                    &IpcResponse::Error(format!("Parse error: {}", e)),
+                )
+                .await?;
+                line.clear();
+                continue;
+            }
+        };
+        let response = handle_request(request, uid, &power_manager, &metrics).await;
         respond(&mut writer, &response).await?;
         line.clear();
     }
@@ -211,12 +262,17 @@ async fn handle_request(
     request: IpcRequest,
     uid: Uid,
     power_manager: &PowerManager,
+    metrics: &MetricsCollector,
 ) -> IpcResponse {
     let is_root = uid.is_root();
 
     match request {
         IpcRequest::GetProfile => IpcResponse::Profile(power_manager.current_profile().await),
         IpcRequest::GetComponents => IpcResponse::Components(power_manager.get_components().await),
+        IpcRequest::GetTotalPower => {
+            let total = metrics.get_total_power().await;
+            IpcResponse::TotalPower(total)
+        }
         IpcRequest::SetProfile(profile) if is_root => {
             match power_manager.set_profile(profile).await {
                 Ok(()) => IpcResponse::Success,

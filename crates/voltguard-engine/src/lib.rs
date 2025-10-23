@@ -1,55 +1,52 @@
+use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::time::interval;
 use voltguard_api::*;
 use voltguard_core::PowerManager;
-
-// Monitoring Engine
+use voltguard_hal::PowerMeter;
 
 pub struct MonitoringEngine {
     power_manager: Arc<PowerManager>,
     metrics_collector: Arc<MetricsCollector>,
+    meters: Vec<Arc<dyn PowerMeter>>,
 }
 
 impl MonitoringEngine {
-    pub fn new(power_manager: Arc<PowerManager>) -> Self {
+    pub fn new(power_manager: Arc<PowerManager>, meters: Vec<Arc<dyn PowerMeter>>) -> Self {
         Self {
             power_manager,
             metrics_collector: Arc::new(MetricsCollector::new()),
+            meters,
         }
     }
 
-    /// Start monitoring all components
     pub async fn start(&self) -> Result<()> {
-        let components = self.power_manager.get_components().await;
-
-        for component in components {
+        // Monitor power meters
+        for meter in &self.meters {
+            let meter = meter.clone();
             let collector = self.metrics_collector.clone();
-            let power_manager = self.power_manager.clone();
-
             tokio::spawn(async move {
-                Self::monitor_component(component.id, power_manager, collector).await;
+                if let Ok(points) = meter.measurement_points().await {
+                    for _p in points {
+                        // share one stream per meter (package-level)
+                        if let Ok(mut stream) = meter
+                            .start_monitoring(std::time::Duration::from_secs(1))
+                            .await
+                        {
+                            while let Some(m) = stream.next().await {
+                                // Use a synthetic component ID per meter point if needed; for now,
+                                // aggregate total power only
+                                // Record under a stable synthetic ID derived from meter address/name could be added later
+                                // For MVP, just push one entry into a global bucket:
+                                collector.record_power(ComponentId::new(), m).await;
+                            }
+                        }
+                    }
+                }
             });
         }
 
         Ok(())
-    }
-
-    async fn monitor_component(
-        id: ComponentId,
-        power_manager: Arc<PowerManager>,
-        collector: Arc<MetricsCollector>,
-    ) {
-        let mut ticker = interval(std::time::Duration::from_secs(1));
-
-        loop {
-            ticker.tick().await;
-
-            if let Some(component) = power_manager.get_component(id).await {
-                if let Some(power) = component.power {
-                    collector.record_power(id, power).await;
-                }
-            }
-        }
     }
 
     pub fn metrics(&self) -> Arc<MetricsCollector> {
@@ -86,7 +83,11 @@ impl MetricsCollector {
         }
     }
 
-    pub async fn get_average_power(&self, id: ComponentId, duration: std::time::Duration) -> Option<f64> {
+    pub async fn get_average_power(
+        &self,
+        id: ComponentId,
+        duration: std::time::Duration,
+    ) -> Option<f64> {
         let history = self.power_history.read().await;
         let measurements = history.get(&id)?;
 
@@ -96,7 +97,10 @@ impl MetricsCollector {
 
         let cutoff = chrono::Utc::now() - chrono::Duration::from_std(duration).ok()?;
 
-        let recent: Vec<_> = measurements.iter().filter(|m| m.timestamp > cutoff).collect();
+        let recent: Vec<_> = measurements
+            .iter()
+            .filter(|m| m.timestamp > cutoff)
+            .collect();
 
         if recent.is_empty() {
             return None;
@@ -128,7 +132,10 @@ pub struct OptimizationEngine {
 
 impl OptimizationEngine {
     pub fn new(power_manager: Arc<PowerManager>, metrics: Arc<MetricsCollector>) -> Self {
-        Self { power_manager, metrics }
+        Self {
+            power_manager,
+            metrics,
+        }
     }
 
     /// Run optimization analysis

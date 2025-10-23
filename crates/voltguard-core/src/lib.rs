@@ -75,12 +75,33 @@ impl PowerManager {
             .await
             .ok_or_else(|| Error::Other(anyhow::anyhow!("No driver for component type")))?;
 
-        // Validate before applying
         if !driver.validate_capability(id, &capability).await? {
             return Err(Error::CapabilityNotSupported(format!("{:?}", capability)));
         }
 
         driver.apply_capability(id, capability.clone()).await?;
+        drop(components);
+
+        // reflect in-memory state so clients see the change immediately
+        {
+            let mut comps = self.components.write().await;
+            if let Some(c) = comps.get_mut(&id) {
+                // replace same-variant capability; fallback to append
+                let mut replaced = false;
+                for cap in &mut c.capabilities {
+                    let same_variant =
+                        std::mem::discriminant(cap) == std::mem::discriminant(&capability);
+                    if same_variant {
+                        *cap = capability.clone();
+                        replaced = true;
+                        break;
+                    }
+                }
+                if !replaced {
+                    c.capabilities.push(capability.clone());
+                }
+            }
+        }
 
         let _ = self
             .event_tx

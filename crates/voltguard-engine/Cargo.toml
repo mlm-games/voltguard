@@ -9,3 +9,5 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 voltguard-api = { path = "../voltguard-api" }
 voltguard-core = { path = "../voltguard-core" }
+voltguard-hal = { path = "../voltguard-hal" }
+futures-util = "0.3.31"

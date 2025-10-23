@@ -10,3 +10,4 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 voltguard-api = { path = "../voltguard-api" }
+voltguard-config = { path = "../voltguard-config" }

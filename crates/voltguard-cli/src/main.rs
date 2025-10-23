@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::path::Path;
+use std::path::PathBuf;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -9,6 +9,10 @@ use voltguard_api::*;
 #[derive(Parser)]
 #[clap(name = "voltguard", about = "Modern power management for Linux")]
 struct Cli {
+    /// Override socket path (arg > env > config)
+    #[clap(long)]
+    socket: Option<PathBuf>,
+
     #[clap(subcommand)]
     command: Commands,
 }
@@ -61,7 +65,7 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let mut client = IpcClient::connect().await?;
+    let mut client = IpcClient::connect(cli.socket).await?;
 
     match cli.command {
         Commands::Status => {
@@ -83,7 +87,10 @@ async fn main() -> anyhow::Result<()> {
             println!("Monitor (interval={}s) not implemented yet.", interval);
         }
         Commands::Report { format, output } => {
-            println!("Report (format={}, output={:?}) not implemented yet.", format, output);
+            println!(
+                "Report (format={}, output={:?}) not implemented yet.",
+                format, output
+            );
         }
     }
 
@@ -93,18 +100,13 @@ async fn main() -> anyhow::Result<()> {
 async fn show_status(client: &mut IpcClient) -> anyhow::Result<()> {
     let profile = client.get_profile().await?;
     let components = client.get_components().await?;
+    let total_power = client.get_total_power().await.unwrap_or_else(|_| 0.0);
 
     println!("VoltGuard Status");
     println!("================");
     println!("Power Profile: {:?}", profile);
     println!();
-
-    let total_power: f64 = components
-        .iter()
-        .filter_map(|c| c.power.map(|p| p.watts))
-        .sum();
-
-    println!("Total Power: {:.2} W", total_power);
+    println!("Total Power (pkg): {:.2} W", total_power);
     println!();
 
     println!("Components:");
@@ -114,7 +116,6 @@ async fn show_status(client: &mut IpcClient) -> anyhow::Result<()> {
             println!("    Power: {:.2} W", power.watts);
         }
     }
-
     Ok(())
 }
 
@@ -164,18 +165,26 @@ async fn handle_profile(client: &mut IpcClient, profile: Option<String>) -> anyh
     Ok(())
 }
 
-// ----------------------------------------------------------------------------
-// IPC Client implementation
-// ----------------------------------------------------------------------------
+/// IPC Client...
 struct IpcClient {
-    stream: UnixStream,
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: tokio::net::unix::OwnedWriteHalf,
 }
 
 impl IpcClient {
-    async fn connect() -> anyhow::Result<Self> {
-        let path = std::env::var("VOLTGUARD_SOCK").unwrap_or_else(|_| "/var/run/voltguard.sock".into());
-        let stream = UnixStream::connect(Path::new(&path)).await?;
-        let mut client = Self { stream };
+    async fn connect(cli_socket: Option<PathBuf>) -> anyhow::Result<Self> {
+        let cfg = voltguard_config::load().unwrap_or_default();
+        let from_cfg = cfg.daemon.socket_path;
+        let path = cli_socket
+            .or_else(|| std::env::var_os("VOLTGUARD_SOCK").map(PathBuf::from))
+            .unwrap_or(from_cfg);
+
+        let stream = UnixStream::connect(&path).await?;
+        let (r, w) = stream.into_split();
+        let mut client = Self {
+            reader: BufReader::new(r),
+            writer: w,
+        };
         client.hello().await?;
         Ok(client)
     }
@@ -192,15 +201,13 @@ impl IpcClient {
     async fn send(&mut self, req: &IpcRequest) -> anyhow::Result<()> {
         let mut buf = serde_json::to_vec(req)?;
         buf.push(b'\n');
-        self.stream.write_all(&buf).await?;
+        self.writer.write_all(&buf).await?;
         Ok(())
     }
 
     async fn recv(&mut self) -> anyhow::Result<IpcResponse> {
-        let (r, _) = self.stream.split();
-        let mut reader = BufReader::new(r);
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        self.reader.read_line(&mut line).await?;
         Ok(serde_json::from_str(&line)?)
     }
 
@@ -226,6 +233,15 @@ impl IpcClient {
         self.send(&IpcRequest::GetComponents).await?;
         match self.recv().await? {
             IpcResponse::Components(c) => Ok(c),
+            IpcResponse::Error(e) => anyhow::bail!(e),
+            r => anyhow::bail!("unexpected response: {r:?}"),
+        }
+    }
+
+    async fn get_total_power(&mut self) -> anyhow::Result<f64> {
+        self.send(&IpcRequest::GetTotalPower).await?;
+        match self.recv().await? {
+            IpcResponse::TotalPower(v) => Ok(v),
             IpcResponse::Error(e) => anyhow::bail!(e),
             r => anyhow::bail!("unexpected response: {r:?}"),
         }

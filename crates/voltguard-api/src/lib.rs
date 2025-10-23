@@ -226,7 +226,7 @@ pub struct ProtocolVersion {
     pub minor: u16,
 }
 
-pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcRequest {
@@ -238,6 +238,7 @@ pub enum IpcRequest {
         id: ComponentId,
         capability: Capability,
     },
+    GetTotalPower,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -247,4 +248,5 @@ pub enum IpcResponse {
     Error(String),
     Profile(PowerProfile),
     Components(Vec<ComponentState>),
+    TotalPower(f64),
 }

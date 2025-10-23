@@ -16,3 +16,4 @@ voltguard-core = { path = "../voltguard-core" }
 voltguard-engine = { path = "../voltguard-engine" }
 voltguard-policy = { path = "../voltguard-policy" }
 voltguard-hal = { path = "../voltguard-hal" }
+voltguard-config = { path = "../voltguard-config" }
