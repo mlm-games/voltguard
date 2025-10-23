@@ -1,0 +1,18 @@
+[package]
+name = "voltguard-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+nix = { workspace = true }
+voltguard-api = { path = "../voltguard-api" }
+voltguard-core = { path = "../voltguard-core" }
+voltguard-engine = { path = "../voltguard-engine" }
+voltguard-policy = { path = "../voltguard-policy" }
+voltguard-hal = { path = "../voltguard-hal" }

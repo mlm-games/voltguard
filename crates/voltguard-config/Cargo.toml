@@ -1,0 +1,12 @@
+[package]
+name = "voltguard-config"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+schemars = { workspace = true }
+figment = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }

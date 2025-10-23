@@ -1,0 +1,11 @@
+[package]
+name = "voltguard-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+voltguard-api = { path = "../voltguard-api" }
+voltguard-core = { path = "../voltguard-core" }

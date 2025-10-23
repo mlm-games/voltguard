@@ -1,0 +1,13 @@
+[package]
+name = "voltguard-policy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+voltguard-api = { path = "../voltguard-api" }
+voltguard-core = { path = "../voltguard-core" }
+tokio.workspace = true
+tracing.workspace = true

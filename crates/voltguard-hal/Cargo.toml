@@ -1,0 +1,20 @@
+[package]
+name = "voltguard-hal"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["linux"]
+linux = []
+linux-rapl = ["linux"]
+linux-hwmon = ["linux"]
+linux-cpu = ["linux"]
+
+[dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+voltguard-api = { path = "../voltguard-api" }
+chrono = "0.4"
+anyhow = "1.0"
