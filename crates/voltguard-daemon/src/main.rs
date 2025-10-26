@@ -26,13 +26,6 @@ async fn main() -> anyhow::Result<()> {
         config::Config::default()
     });
 
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", &cfg.daemon.log_level);
-    }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     // Build the daemon
     let daemon = Daemon::new(cfg).await?;
 
