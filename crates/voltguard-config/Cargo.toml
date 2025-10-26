@@ -10,3 +10,4 @@ schemars = { workspace = true }
 figment = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
+serde_with = { workspace = true }

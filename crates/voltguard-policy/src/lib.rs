@@ -52,8 +52,13 @@ impl PolicyEngine {
             PolicyAction::SetProfile(profile) => {
                 self.power_manager.set_profile(profile).await?;
             }
-            PolicyAction::ApplyCapability { component_id, capability } => {
-                self.power_manager.apply_capability(component_id, capability).await?;
+            PolicyAction::ApplyCapability {
+                component_id,
+                capability,
+            } => {
+                self.power_manager
+                    .apply_capability(component_id, capability)
+                    .await?;
             }
             PolicyAction::Notify(message) => {
                 tracing::warn!("Policy notification: {}", message);
@@ -90,7 +95,10 @@ pub enum Severity {
 #[derive(Debug, Clone)]
 pub enum PolicyAction {
     SetProfile(PowerProfile),
-    ApplyCapability { component_id: ComponentId, capability: Capability },
+    ApplyCapability {
+        component_id: ComponentId,
+        capability: Capability,
+    },
     Notify(String),
 }
 
@@ -173,19 +181,21 @@ impl Policy for TimeBasedPolicy {
         let current_profile = manager.current_profile().await;
 
         for schedule in &self.schedules {
-            if now >= schedule.start_time && now < schedule.end_time {
-                if current_profile != schedule.profile {
-                    return Some(PolicyViolation {
-                        policy_name: self.name().to_string(),
-                        severity: Severity::Info,
-                        message: format!("Time-based profile change to {:?}", schedule.profile),
-                        remediation: Some(PolicyAction::SetProfile(schedule.profile)),
-                    });
-                }
-                break;
+            let in_window = if schedule.start_time <= schedule.end_time {
+                now >= schedule.start_time && now < schedule.end_time
+            } else {
+                // wraps midnight
+                now >= schedule.start_time || now < schedule.end_time
+            };
+            if in_window && current_profile != schedule.profile {
+                return Some(PolicyViolation {
+                    policy_name: self.name().to_string(),
+                    severity: Severity::Info,
+                    message: format!("Time-based profile change to {:?}", schedule.profile),
+                    remediation: Some(PolicyAction::SetProfile(schedule.profile)),
+                });
             }
         }
-
         None
     }
 }

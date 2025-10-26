@@ -1,5 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, DurationSeconds};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
@@ -71,9 +72,12 @@ pub struct TimeBasedRule {
     pub profile: String,
 }
 
+#[serde_as]
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 #[serde(default)]
 pub struct MonitoringConfig {
+    #[serde_as(as = "DurationSeconds<u64>")]
+    #[schemars(with = "u64")]
     pub interval: Duration,
     pub history_size: usize,
     pub export_metrics: bool,

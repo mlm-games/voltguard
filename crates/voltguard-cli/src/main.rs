@@ -106,7 +106,7 @@ async fn show_status(client: &mut IpcClient) -> anyhow::Result<()> {
     println!("================");
     println!("Power Profile: {:?}", profile);
     println!();
-    println!("Total Power (pkg): {:.2} W", total_power);
+    println!("Total Power (CPU package): {:.2} W", total_power);
     println!();
 
     println!("Components:");

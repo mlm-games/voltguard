@@ -1,4 +1,4 @@
-use futures_util::StreamExt;
+use futures::StreamExt;
 use std::sync::Arc;
 use tokio::time::interval;
 use voltguard_api::*;
@@ -20,33 +20,34 @@ impl MonitoringEngine {
         }
     }
 
-    pub async fn start(&self) -> Result<()> {
-        // Monitor power meters
+    pub async fn start(&self, interval: std::time::Duration) -> Result<()> {
+        // change signature
         for meter in &self.meters {
             let meter = meter.clone();
             let collector = self.metrics_collector.clone();
             tokio::spawn(async move {
                 if let Ok(points) = meter.measurement_points().await {
-                    for _p in points {
-                        // share one stream per meter (package-level)
-                        if let Ok(mut stream) = meter
-                            .start_monitoring(std::time::Duration::from_secs(1))
-                            .await
-                        {
-                            while let Some(m) = stream.next().await {
-                                // Use a synthetic component ID per meter point if needed; for now,
-                                // aggregate total power only
-                                // Record under a stable synthetic ID derived from meter address/name could be added later
-                                // For MVP, just push one entry into a global bucket:
-                                collector.record_power(ComponentId::new(), m).await;
+                    for point in points {
+                        let meter = meter.clone();
+                        let collector = collector.clone();
+                        tokio::spawn(async move {
+                            if let Ok(mut stream) =
+                                meter.start_monitoring(point.clone(), interval).await
+                            {
+                                while let Some(m) = stream.next().await {
+                                    collector.record_power(point.id, m).await;
+                                }
                             }
-                        }
+                        });
                     }
                 }
             });
         }
-
         Ok(())
+    }
+
+    pub async fn start_default(&self) -> Result<()> {
+        self.start(std::time::Duration::from_secs(1)).await
     }
 
     pub fn metrics(&self) -> Arc<MetricsCollector> {

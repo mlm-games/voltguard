@@ -26,6 +26,13 @@ async fn main() -> anyhow::Result<()> {
         config::Config::default()
     });
 
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", &cfg.daemon.log_level);
+    }
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     // Build the daemon
     let daemon = Daemon::new(cfg).await?;
 
@@ -41,6 +48,7 @@ struct Daemon {
     optimization_engine: Arc<OptimizationEngine>,
     policy_engine: Arc<PolicyEngine>,
     socket_path: std::path::PathBuf,
+    interval: std::time::Duration,
 }
 
 impl Daemon {
@@ -77,13 +85,13 @@ impl Daemon {
             optimization_engine,
             policy_engine,
             socket_path: cfg.daemon.socket_path,
+            interval: cfg.monitoring.interval,
         })
     }
 
     async fn run(self) -> anyhow::Result<()> {
         // Start monitoring
-        self.monitoring_engine.start().await?;
-
+        self.monitoring_engine.start(self.interval).await?;
         // Start periodic policy enforcement
         let policy_engine = self.policy_engine.clone();
         tokio::spawn(async move {
@@ -159,14 +167,20 @@ impl IpcServer {
 
     async fn run(&self) -> anyhow::Result<()> {
         let socket_path = &self.socket_path;
-
-        // Remove old socket if exists
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // refuse symlink targets
+        if let Ok(md) = std::fs::symlink_metadata(socket_path) {
+            if md.file_type().is_symlink() {
+                anyhow::bail!(
+                    "Refusing to bind to symlinked socket path: {}",
+                    socket_path.display()
+                );
+            }
+        }
         let _ = std::fs::remove_file(socket_path);
-
         let listener = UnixListener::bind(socket_path)?;
-        info!("IPC server listening on {}", socket_path.display());
-
-        // Tighten perms: 0660; optionally honor VOLTGUARD_GROUP for group ownership
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
         if let Ok(group) = std::env::var("VOLTGUARD_GROUP") {

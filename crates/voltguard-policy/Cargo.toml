@@ -9,5 +9,5 @@ serde = { workspace = true }
 chrono = { workspace = true }
 voltguard-api = { path = "../voltguard-api" }
 voltguard-core = { path = "../voltguard-core" }
-tokio.workspace = true
-tracing.workspace = true
+tokio = { workspace = true }
+tracing = { workspace = true }

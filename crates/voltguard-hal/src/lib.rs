@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 use voltguard_api::*;
 
 // Core HAL Traits
@@ -39,7 +40,11 @@ pub trait PowerMeter: Send + Sync {
     async fn read_power(&self, point: &MeasurementPoint) -> Result<PowerMeasurement>;
 
     /// Start continuous monitoring
-    async fn start_monitoring(&self, interval: std::time::Duration) -> Result<MeasurementStream>;
+    async fn start_monitoring(
+        &self,
+        point: MeasurementPoint,
+        interval: std::time::Duration,
+    ) -> Result<MeasurementStream>;
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +150,8 @@ impl DriverRegistry {
 
 #[cfg(feature = "linux")]
 pub mod linux {
+    use std::os::unix::ffi::OsStrExt;
+
     use super::*;
 
     /// CPU driver using sysfs (simplified demo)
@@ -232,7 +239,9 @@ pub mod linux {
                     let path = self
                         .base_path
                         .join(format!("cpu{cpu}/cpufreq/scaling_governor"));
-                    self.fs.write_all(&path, current.as_bytes()).await?;
+                    self.fs
+                        .write_all(&path, format!("{current}\n").as_bytes())
+                        .await?;
                 }
                 Ok(())
             } else {
@@ -259,7 +268,7 @@ pub mod linux {
         fs: std::sync::Arc<F>,
     }
 
-    impl Default for RaplPowerMeter {
+    impl Default for RaplPowerMeter<OsFs> {
         fn default() -> Self {
             Self {
                 base_path: "/sys/class/powercap/intel-rapl".into(),
@@ -268,32 +277,48 @@ pub mod linux {
         }
     }
 
-    impl CpuDriver {
+    impl CpuDriver<OsFs> {
         pub fn new() -> Self {
             Self::new_with_fs(std::sync::Arc::new(OsFs))
+        }
+    }
+
+    impl<F: Filesystem + 'static> RaplPowerMeter<F> {
+        async fn make_point(&self, rapl_dir: &std::path::Path) -> Result<MeasurementPoint> {
+            let name = self
+                .fs
+                .read_to_string(&rapl_dir.join("name"))
+                .await
+                .unwrap_or_else(|_| "package-0".into());
+            let id = ComponentId(Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                rapl_dir.as_os_str().as_bytes(),
+            ));
+            Ok(MeasurementPoint {
+                id,
+                name,
+                measurement_type: MeasurementType::Rapl,
+            })
         }
     }
 
     #[async_trait]
     impl<F: Filesystem + 'static> PowerMeter for RaplPowerMeter<F> {
         async fn measurement_points(&self) -> Result<Vec<MeasurementPoint>> {
-            // Treat package-0 as a single point for now
+            // For MVP, only intel-rapl:0 (extend later to scan rapl domains)
             let pkg = self.base_path.join("intel-rapl:0");
-            let name = self
-                .fs
-                .read_to_string(&pkg.join("name"))
-                .await
-                .unwrap_or_else(|_| "package-0".into());
-            Ok(vec![MeasurementPoint {
-                id: ComponentId::new(), // not tied to a discovered component yet
-                name,
-                measurement_type: MeasurementType::Rapl,
-            }])
+            if tokio::fs::try_exists(&pkg).await.unwrap_or(false) {
+                Ok(vec![self.make_point(&pkg).await?])
+            } else {
+                Ok(vec![]) // no RAPL available
+            }
         }
 
-        async fn read_power(&self, _point: &MeasurementPoint) -> Result<PowerMeasurement> {
-            // One-shot read: sample energy_uj twice with a short delay
-            let energy_path = self.base_path.join("intel-rapl:0/energy_uj");
+        async fn read_power(&self, point: &MeasurementPoint) -> Result<PowerMeasurement> {
+            let rapl_dir = self.base_path.join("intel-rapl:0");
+            let energy_path = rapl_dir.join("energy_uj");
+            let max_path = rapl_dir.join("max_energy_range_uj");
+
             let t0 = chrono::Utc::now();
             let e0 = self
                 .fs
@@ -311,9 +336,22 @@ pub mod linux {
                 .trim()
                 .parse::<u64>()
                 .map_err(|e| Error::Parse(e.to_string()))?;
+            let max = self
+                .fs
+                .read_to_string(&max_path)
+                .await
+                .unwrap_or_else(|_| "0".into())
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(0);
 
-            // handle wrap-around with u64 energy counter by saturating at 0 if misordered
-            let de_uj = e1.saturating_sub(e0) as f64;
+            let de_uj = if e1 >= e0 {
+                e1 - e0
+            } else if max > 0 {
+                (max - e0) + e1
+            } else {
+                0
+            } as f64;
             let dt_s = (t1 - t0).num_microseconds().unwrap_or(50_000) as f64 / 1_000_000.0;
             let watts = if dt_s > 0.0 {
                 (de_uj / 1_000_000.0) / dt_s
@@ -330,27 +368,33 @@ pub mod linux {
 
         async fn start_monitoring(
             &self,
+            point: MeasurementPoint,
             interval: std::time::Duration,
         ) -> Result<MeasurementStream> {
-            let energy_path = self.base_path.join("intel-rapl:0/energy_uj");
+            let rapl_dir = self.base_path.join("intel-rapl:0");
+            let energy_path = rapl_dir.join("energy_uj");
+            let max_path = rapl_dir.join("max_energy_range_uj");
             let fs = self.fs.clone();
 
-            let mut last_e = None::<u64>;
-            let mut last_t = None::<chrono::DateTime<chrono::Utc>>;
-
             let s = async_stream::stream! {
+                let mut last_e: Option<u64> = None;
+                let mut last_t: Option<chrono::DateTime<chrono::Utc>> = None;
+                let max: u64 = fs.read_to_string(&max_path).await
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+
                 loop {
                     let now = chrono::Utc::now();
-                    let e = match fs.read_to_string(&energy_path).await {
-                        Ok(s) => match s.trim().parse::<u64>() {
-                            Ok(v) => v,
-                            Err(_) => { tokio::time::sleep(interval).await; continue; }
-                        },
-                        Err(_) => { tokio::time::sleep(interval).await; continue; }
-                    };
+                    let e = match fs.read_to_string(&energy_path).await
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok()) {
+                            Some(v) => v,
+                            None => { tokio::time::sleep(interval).await; continue; }
+                        };
 
                     if let (Some(e0), Some(t0)) = (last_e, last_t) {
-                        let de_uj = e.saturating_sub(e0) as f64;
+                        let de_uj = if e >= e0 { e - e0 } else if max > 0 { (max - e0) + e } else { 0 } as f64;
                         let dt_s = (now - t0).num_microseconds().unwrap_or(0) as f64 / 1_000_000.0;
                         if dt_s > 0.0 {
                             let watts = (de_uj / 1_000_000.0) / dt_s;
